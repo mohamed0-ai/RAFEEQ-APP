@@ -1,0 +1,13 @@
+{
+  "name": "rafeeq",
+  "private": true,
+  "workspaces": ["packages/*", "web", "worker"],
+  "scripts": {
+    "dev:web": "npm -w web run dev",
+    "dev:worker": "npm -w worker run dev",
+    "build": "npm -w packages/schema run build && npm -w web run build",
+    "lint": "npm -w web run lint && npm -w worker run lint",
+    "typecheck": "npm -w web run typecheck && npm -w worker run typecheck",
+    "test": "npm -w packages/schema run test && npm -w web run test"
+  }
+}
