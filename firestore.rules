@@ -1,0 +1,167 @@
+rules_version = '2';
+// Rafeeq — deny by default. Owner: [DB] + [SEC]. Keep in sync with docs/DATABASE.md.
+// Multi-user (max 10). Access control lives in allowedUsers/{uid} (server-written only).
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---- access helpers ----
+    function signedIn() { return request.auth != null; }
+
+    // A user is allowed if they have an active doc in allowedUsers.
+    // Uses get() — Firestore bills this as 1 read per rules evaluation.
+    // The Worker caches this in KV (60 s) to reduce Firestore reads from the server side;
+    // Firestore rules cannot be bypassed, so this get() is the security guarantee.
+    function isAllowed(uid) {
+      return signedIn()
+        && request.auth.uid == uid
+        && request.auth.token.email_verified == true
+        && exists(/databases/$(database)/documents/allowedUsers/$(uid))
+        && get(/databases/$(database)/documents/allowedUsers/$(uid)).data.status == 'active';
+    }
+
+    function d() { return request.resource.data; }
+    function onlyKeys(keys) { return d().keys().hasOnly(keys); }
+    function touched() { return d().diff(resource == null ? {} : resource.data).affectedKeys(); }
+    function stampOk() { return d().updatedAt == request.time; }
+    function optTs(f) { return !(f in d()) || d()[f] == null || d()[f] is timestamp; }
+    function optStr(f, max) { return !(f in d()) || d()[f] == null || (d()[f] is string && d()[f].size() <= max); }
+    function money(f) { return d()[f] is int && d()[f] > 0 && d()[f] <= 1000000000; }
+
+    // ---- allowedUsers — client can read own doc; never write (service account only) ----
+    match /allowedUsers/{uid} {
+      allow read: if signedIn() && request.auth.uid == uid;
+      allow write: if false; // Worker service account bypasses rules
+    }
+
+    // ---- user root ----
+    match /users/{uid} {
+      allow read: if isAllowed(uid);
+      allow create, update: if isAllowed(uid)
+        && onlyKeys(['displayName','email','photoURL','settings','calendar','createdAt','updatedAt'])
+        && !('calendar' in touched())   // server-managed
+        && stampOk();
+      allow delete: if false;
+
+      // ---------- tasks ----------
+      match /tasks/{taskId} {
+        function validTask() {
+          return onlyKeys(['title','notes','status','priority','tags','dueAt','allDay',
+                           'reminderOffsetsMin','nextReminderAt','recurrence','parentTaskId',
+                           'calendarEventId','source','voiceCaptureId','completedAt','deletedAt',
+                           'createdAt','updatedAt'])
+            && d().title is string && d().title.size() > 0 && d().title.size() <= 200
+            && optStr('notes', 5000)
+            && d().status in ['todo','doing','done','cancelled']
+            && d().priority in ['low','medium','high','urgent']
+            && (!('tags' in d()) || (d().tags is list && d().tags.size() <= 10))
+            && optTs('dueAt') && optTs('completedAt') && optTs('deletedAt')
+            && (!('reminderOffsetsMin' in d()) || (d().reminderOffsetsMin is list && d().reminderOffsetsMin.size() <= 3))
+            && d().source in ['manual','voice','text','calendar']
+            && stampOk();
+        }
+        // server-managed fields the client may not change
+        function serverFieldsUntouched() {
+          return !touched().hasAny(['nextReminderAt','calendarEventId']);
+        }
+        allow read: if isAllowed(uid);
+        allow create: if isAllowed(uid) && validTask() && serverFieldsUntouched();
+        allow update: if isAllowed(uid) && validTask() && serverFieldsUntouched();
+        allow delete: if false; // soft delete via deletedAt
+      }
+
+      // ---------- categories ----------
+      match /categories/{id} {
+        allow read: if isAllowed(uid);
+        allow create, update: if isAllowed(uid)
+          && onlyKeys(['name','icon','color','kind','monthlyBudgetPiasters','archived','order','createdAt','updatedAt'])
+          && d().name is string && d().name.size() > 0 && d().name.size() <= 40
+          && d().kind in ['expense','income']
+          && (!('monthlyBudgetPiasters' in d()) || d().monthlyBudgetPiasters == null || money('monthlyBudgetPiasters'))
+          && stampOk();
+        allow delete: if false; // archive instead
+      }
+
+      // ---------- transactions ----------
+      match /transactions/{txId} {
+        allow read: if isAllowed(uid);
+        allow create, update: if isAllowed(uid)
+          && onlyKeys(['kind','amountPiasters','currency','categoryId','note','occurredAt','paymentMethod',
+                       'goalId','recurringId','receiptText','source','deletedAt','createdAt','updatedAt'])
+          && d().kind in ['expense','income','transfer_to_goal']
+          && money('amountPiasters')
+          && d().currency == 'EGP'
+          && d().categoryId is string
+          && exists(/databases/$(database)/documents/users/$(uid)/categories/$(d().categoryId))
+          && optStr('note', 500)
+          && d().occurredAt is timestamp
+          && d().paymentMethod in ['cash','card','wallet','instapay','other']
+          && d().source in ['manual','voice','text','receipt','recurring']
+          && optTs('deletedAt')
+          && stampOk();
+        allow delete: if false;
+      }
+
+      // ---------- savings goals ----------
+      match /goals/{goalId} {
+        allow read: if isAllowed(uid);
+        allow create, update: if isAllowed(uid)
+          && onlyKeys(['title','targetPiasters','savedPiasters','startDate','deadline','period',
+                       'requiredPerPeriodPiasters','feasibility','status','createdAt','updatedAt'])
+          && !touched().hasAny(['savedPiasters','requiredPerPeriodPiasters','feasibility']) // server-computed
+          && d().title is string && d().title.size() > 0 && d().title.size() <= 100
+          && money('targetPiasters')
+          && d().deadline is timestamp
+          && d().period in ['weekly','monthly']
+          && d().status in ['active','achieved','paused']
+          && stampOk();
+        allow delete: if isAllowed(uid);
+      }
+
+      // ---------- recurring / debts / gameyas ----------
+      match /recurring/{id} {
+        allow read, delete: if isAllowed(uid);
+        allow create, update: if isAllowed(uid)
+          && onlyKeys(['kind','title','amountPiasters','categoryId','rrule','tz','nextRunAt','autoCreate','active','createdAt','updatedAt'])
+          && !touched().hasAny(['nextRunAt'])
+          && money('amountPiasters') && d().rrule is string && d().rrule.size() <= 200
+          && stampOk();
+      }
+      match /debts/{id} {
+        allow read, delete: if isAllowed(uid);
+        allow create, update: if isAllowed(uid)
+          && onlyKeys(['person','direction','amountPiasters','paidPiasters','dueAt','note','settledAt','createdAt','updatedAt'])
+          && d().direction in ['owed_to_me','i_owe'] && money('amountPiasters')
+          && stampOk();
+      }
+      match /gameyas/{id} {
+        allow read, delete: if isAllowed(uid);
+        allow create, update: if isAllowed(uid)
+          && onlyKeys(['title','membersCount','monthlyPiasters','startMonth','myTurn','payments','createdAt','updatedAt'])
+          && d().membersCount is int && d().membersCount > 1 && d().membersCount <= 60
+          && money('monthlyPiasters')
+          && stampOk();
+      }
+
+      // ---------- devices (Web Push subscriptions) ----------
+      match /devices/{deviceId} {
+        allow read, delete: if isAllowed(uid);
+        allow create, update: if isAllowed(uid)
+          && onlyKeys(['pushSubscription','platform','userAgent','createdAt','lastSeenAt'])
+          && d().pushSubscription is map
+          && d().pushSubscription.endpoint is string && d().pushSubscription.endpoint.size() < 2048
+          && d().pushSubscription.endpoint.matches('https://.*')
+          && d().platform in ['android','ios','desktop'];
+      }
+
+      // ---------- server-written only ----------
+      match /voiceCaptures/{id} { allow read: if isAllowed(uid); allow write: if false; }
+      match /stats/{month}      { allow read: if isAllowed(uid); allow write: if false; }
+    }
+
+    // ---------- server-only (Worker uses a service account, which bypasses rules) ----------
+    match /integrations/{uid}  { allow read, write: if false; }
+
+    // ---------- everything else ----------
+    match /{document=**} { allow read, write: if false; }
+  }
+}
